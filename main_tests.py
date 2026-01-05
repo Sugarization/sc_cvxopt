@@ -4,6 +4,8 @@ import torchvision
 import torchvision.transforms as transforms
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg')  # 不需要显示窗口，直接保存图片
 import time
 
 # ==========================================
@@ -52,7 +54,9 @@ def grad_F(u, ds):
     F(u) = (alpha * N / 2) ||u||^2 - <x_hat, u>
     grad_F(u) = alpha * N * u - x_hat
     """
-    return ds.alpha * ds.N * u - ds.x_hat
+    # return ds.alpha * ds.N * u - ds.x_hat
+    return ds.alpha * u - (ds.x_hat / ds.N)
+    
 
 def inner_gd(u_last, v_last, ds, params, rng):
     """
@@ -103,12 +107,22 @@ def parallel_douglas_rachford_gpu(tau, inits, n_iter, inner_params, ds, X_test, 
     hist_test_acc = []   # 新增：测试集准确率历史
     hist_test_loss = []  # 新增：测试集损失历史
     
+    # 评估训练集
+    train_acc, train_loss = evaluate_model(u_t, ds)
+    hist_train_acc.append(train_acc)
+    hist_train_loss.append(train_loss)
+    
+    # 评估测试集（每个 iteration）
+    test_acc, test_loss = evaluate_on_test(u_t, X_test, Y_test)
+    hist_test_acc.append(test_acc)
+    hist_test_loss.append(test_loss)
+
     print(f"Starting Parallel DR on {device} (N={ds.N}, Alpha={ds.alpha}, Tau={tau})...")
     start_time = time.time()
     
-    initial_tau = 0.3
     for t in range(n_iter):
-        current_tau = initial_tau * (0.95 ** (t // 10)) # 每10轮乘0.95
+        current_tau = tau * (0.9 ** t) # 每轮乘0.95
+        # current_tau = tau 
         
         # Step 1 & 2: 分批次并行求解 N 个 argmin 子问题，并更新 v
         for start in range(0, ds.N, batch_size):
@@ -116,9 +130,10 @@ def parallel_douglas_rachford_gpu(tau, inits, n_iter, inner_params, ds, X_test, 
             rng = range(start, end)
             rng_tensor = torch.tensor(list(rng), device=device)
             
+            start_time1 = time.time()
             # 求解当前批次的子问题 (在 GPU 上并行计算)
             u_batch = inner_gd(u_t, v_t, ds, inner_params, rng)  # (batch_size, K, d)
-            
+            elapsed1 = time.time() - start_time1
             # 更新对偶变量 v
             v_t[rng_tensor] = v_t[rng_tensor] + current_tau * (grad_F(u_batch, ds) - grad_F(u_t, ds))
         
@@ -193,6 +208,18 @@ def baseline_sgd(ds, X_test, Y_test, n_epochs=30, lr=0.01, momentum=0.9, batch_s
     hist_test_acc = []   # 新增：测试集准确率历史
     hist_test_loss = []  # 新增：测试集损失历史
     
+
+    # 评估训练集
+    with torch.no_grad():
+        train_acc, train_loss = evaluate_model(w.detach(), ds)
+        hist_train_acc.append(train_acc)
+        hist_train_loss.append(train_loss)
+        
+        # 评估测试集（每个 epoch）
+        test_acc, test_loss = evaluate_on_test(w.detach(), X_test, Y_test)
+        hist_test_acc.append(test_acc)
+        hist_test_loss.append(test_loss)
+
     for epoch in range(n_epochs):
         # 随机打乱数据
         perm = torch.randperm(ds.N, device=device)
@@ -325,10 +352,10 @@ def prepare_test_data(n_test_samples=300):
 
 if __name__ == "__main__":
     # 参数设置
-    N_SAMPLES = 1000
-    N_TEST_SAMPLES = 300
-    ALPHA = 0.001       # 正则化系数
-    N_ITER = 200        # 外层迭代次数
+    N_SAMPLES = 60000
+    N_TEST_SAMPLES = 1000
+    ALPHA = 1       # 正则化系数
+    N_ITER = 10        # 外层迭代次数
     
     # 准备训练数据 (自动移到 GPU)
     X, Y, x_hat, N, K, d = prepare_data(N_SAMPLES)
@@ -344,17 +371,28 @@ if __name__ == "__main__":
     print("Method 1: Parallel Douglas-Rachford (GPU)")
     print("="*60)
     
-    # 初始化
-    std = torch.sqrt(torch.tensor(2.0 / (K + d)))
-    u0 = torch.randn(K, d, device=device) * std
-    v0 = torch.randn(N, K, d, device=device) * 0.01
+    # # 初始化
+    # std = torch.sqrt(torch.tensor(2.0 / (K + d)))
+    # u0 = torch.randn(K, d, device=device) * std
+    # v0 = torch.randn(N, K, d, device=device) * 0.01
+    # 使用零初始化
+    # u0 = torch.zeros(K, d, device=device)
+    # v0 = torch.zeros(N, K, d, device=device)
+    # inits = Inits(u0, v0)
+
+    u0 = torch.zeros(K, d, device=device)
+
+    # v^0_j = (1/N) * ∇F(u^0)
+    v0_template = grad_F(u0, ds) / ds.N  # (K, d)
+    v0 = v0_template.unsqueeze(0).repeat(ds.N, 1, 1)  # (N, K, d)
+
     inits = Inits(u0, v0)
-    
-    inner_params = Params(n_iter=100, lr=0.001)
+
+    inner_params = Params(n_iter=20, lr=1e-3)
     
     # 运行 DR 算法（传入测试集）
     w_dr, hist_train_acc_dr, hist_train_loss_dr, hist_test_acc_dr, hist_test_loss_dr = parallel_douglas_rachford_gpu(
-        tau=0.1,
+        tau=15,
         inits=inits,
         n_iter=N_ITER,
         inner_params=inner_params,
@@ -375,7 +413,7 @@ if __name__ == "__main__":
         X_test,
         Y_test,
         n_epochs=N_ITER,
-        lr=0.01,
+        lr=1e-4,
         momentum=0.9,
         batch_size=64
     )
@@ -443,3 +481,5 @@ if __name__ == "__main__":
     print("="*60)
     
     plt.show()
+
+#放图
